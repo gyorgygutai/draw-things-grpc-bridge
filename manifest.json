@@ -1,0 +1,10 @@
+{
+  "id": "draw-things-grpc-bridge",
+  "name": "Draw Things Bridge",
+  "version": "1.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Generate images via Draw Things gRPC API.",
+  "author": "György Gutai",
+  "authorUrl": "",
+  "isDesktopOnly": true
+}

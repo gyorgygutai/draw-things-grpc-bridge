@@ -1,0 +1,32 @@
+{
+  "name": "draw-things-grpc-bridge",
+  "version": "1.0.0",
+  "description": "Generate images via Draw Things gRPC API.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "esbuild src/main.ts --bundle --external:obsidian --external:@codemirror/state --external:@codemirror/view --format=cjs --watch --platform=node --target=es2022 --outfile=main.js",
+    "build": "esbuild src/main.ts --bundle --external:obsidian --external:@codemirror/state --external:@codemirror/view --format=cjs --minify --platform=node --target=es2022 --outfile=main.js",
+    "codegen": "protoc --plugin=protoc-gen-ts_proto=./node_modules/.bin/protoc-gen-ts_proto --ts_proto_out=./proto/generated --ts_proto_opt=outputServices=grpc-js,esModuleInterop=true,useOptionals=messages,proto3=true ./proto/draw_things.proto && flatc --ts -o ./proto/generated ./proto/config.fbs",
+    "test": "vitest run --config tests/vitest.config.ts"
+  },
+  "author": "György Gutai",
+  "license": "MIT",
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.12.0",
+    "@grpc/grpc-js": "^1.10.0",
+    "canvas": "^3.1.0",
+    "flatbuffers": "^24.3.25"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "0.21.0",
+    "eslint": "^8.57.1",
+    "eslint-plugin-obsidian": "^2.31.0",
+    "grpc-tools": "^1.13.1",
+    "obsidian": "latest",
+    "ts-proto": "^2.11.8",
+    "tsx": "^4.22.0",
+    "typescript": "^5.4.0",
+    "vitest": "^3.0.0"
+  }
+}
