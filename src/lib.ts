@@ -16,7 +16,7 @@ import {
 import {
   GenerationConfiguration,
   SamplerType,
-} from "../proto/generated/config_generated";
+} from "../proto/generated/config";
 
 const HEADER_BYTES = 68;
 const CHUNK_SIZE = 1024 * 1024;
@@ -30,9 +30,9 @@ function f16ToF32(h: number): number {
   return s * Math.pow(2, e - 15) * (1 + m / 1024);
 }
 
-async function sha256(bytes: Uint8Array): Promise<Uint8Array> {
-  const buf = await crypto.subtle.digest("SHA-256", bytes);
-  return new Uint8Array(buf);
+async function sha256(bytes: Uint8Array): Promise<Uint8Array<ArrayBuffer>> {
+  const buf = await crypto.subtle.digest("SHA-256", bytes as Uint8Array<ArrayBuffer>);
+  return new Uint8Array(buf as ArrayBuffer);
 }
 
 function toHex(bytes: Uint8Array): string {

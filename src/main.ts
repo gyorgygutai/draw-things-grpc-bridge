@@ -6,8 +6,6 @@ import { Decoration, DecorationSet, EditorView, GutterMarker, gutter } from "@co
 
 const VIEW_TYPE = "draw-things-grpc-bridge";
 
-// --- Prompt parser ---
-
 interface PromptRegion {
   text: string;
   startLine: number; // 0-based, line after the ## Prompt heading
@@ -113,8 +111,8 @@ const DEFAULT_FORM_VALUES = {
   height: 512,
 };
 
-interface DTSettings { host: string; out: string; }
-const DEFAULTS: DTSettings = { host: "127.0.0.1:7888", out: ".dt-output" };
+interface DTSettings { host: string; out: string; recentImagesCount: number; }
+const DEFAULTS: DTSettings = { host: "127.0.0.1:7888", out: ".dt-output", recentImagesCount: 15 };
 
 class FileSuggest extends AbstractInputSuggest<SearchResult> {
   private cb: (file: TFile) => void;
@@ -152,11 +150,26 @@ class DTView extends ItemView {
   getDisplayText() { return "Draw Things"; }
   getIcon() { return "image"; }
 
+  private imageStrip: HTMLElement | null = null;
+
   async onOpen() {
     this.render();
+    const active = this.app.workspace.getActiveFile();
+    if (active instanceof TFile) this.syncFormFromFrontmatter(active);
     this.updateControlsState();
     this.registerEvent(
-      this.app.workspace.on('active-leaf-change', () => this.updateControlsState())
+      this.app.workspace.on('active-leaf-change', async () => {
+        this.updateControlsState();
+        const active = this.app.workspace.getActiveFile();
+        if (active instanceof TFile) this.syncFormFromFrontmatter(active);
+      })
+    );
+    this.registerEvent(
+      this.app.metadataCache.on('changed', (file) => {
+        if (file === this.app.workspace.getActiveFile()) {
+          this.renderImageStrip();
+        }
+      })
     );
     this.intersectionObserver = new IntersectionObserver(
       ([entry]) => {
@@ -249,6 +262,14 @@ class DTView extends ItemView {
       return r;
     };
 
+    const separatedRow = (label: string, parent = root) => {
+      const r = parent.createDiv({ cls: "dt-separated-row" });
+
+      r.createEl("hr", { text: label, cls: "dt-hr" });
+
+      return row(label, parent);
+    };
+
     const modelRow = row("Model");
     modelRow.createEl("span", { text: DEFAULT_FORM_VALUES.model, cls: "dt-model" });
 
@@ -305,39 +326,6 @@ class DTView extends ItemView {
 
     const btn = root.createEl("button", { text: "Generate", cls: "dt-btn" });
 
-    let currentModel = DEFAULT_FORM_VALUES.model;
-    const activeFile = this.app.workspace.getActiveFile();
-    if (activeFile instanceof TFile) {
-      const fm = this.app.metadataCache.getFileCache(activeFile)?.frontmatter;
-      if (fm) {
-        if (typeof fm["dt-model"] === "string" && fm["dt-model"].trim().length > 0) {
-          currentModel = fm["dt-model"].trim();
-          const modelSpan = modelRow.querySelector(".dt-model") as HTMLElement;
-          if (modelSpan) modelSpan.textContent = currentModel;
-        }
-        if (fm["dt-steps"] !== undefined) {
-          const v = parseInt(String(fm["dt-steps"]));
-          if (!isNaN(v) && v >= 1 && v <= 100) { stepsSlider.value = String(v); stepsVal.textContent = String(v); }
-        }
-        if (fm["dt-cfg"] !== undefined) {
-          const v = parseFloat(String(fm["dt-cfg"]));
-          if (!isNaN(v) && v >= 1 && v <= 20) { cfgSlider.value = String(v); cfgVal.textContent = String(v); }
-        }
-        if (fm["dt-sampler"] !== undefined) {
-          const v = parseInt(String(fm["dt-sampler"]));
-          if (!isNaN(v) && SAMPLERS.some(([, id]) => id === v)) sampSel.value = String(v);
-        }
-        if (fm["dt-width"] !== undefined) {
-          const v = parseInt(String(fm["dt-width"]));
-          if (!isNaN(v) && v > 0) wIn.value = String(v);
-        }
-        if (fm["dt-height"] !== undefined) {
-          const v = parseInt(String(fm["dt-height"]));
-          if (!isNaN(v) && v > 0) hIn.value = String(v);
-        }
-      }
-    }
-
     btn.onclick = async () => {
       const file = this.app.workspace.getActiveFile();
       if (!(file instanceof TFile)) { new Notice("No active note"); return; }
@@ -371,7 +359,7 @@ class DTView extends ItemView {
           parseInt(sampSel.value),
           w, h,
           Math.floor(Math.random() * 0xffffffff),
-          currentModel,
+          (this.containerEl.querySelector(".dt-model") as HTMLElement)?.textContent || DEFAULT_FORM_VALUES.model,
           this.app.vault,
           normalizePath(this.plugin.settings.out),
           inputImageBytes,
@@ -394,6 +382,79 @@ class DTView extends ItemView {
     };
 
     injectStyles();
+
+    this.imageStrip = root.createDiv({ cls: "dt-image-strip" });
+    this.renderImageStrip();
+  }
+
+  private syncFormFromFrontmatter(file: TFile) {
+    const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+    if (!fm) return;
+
+    // Model
+    if (typeof fm["dt-model"] === "string") {
+      const span = this.containerEl.querySelector(".dt-model") as HTMLElement;
+      if (span) span.textContent = fm["dt-model"];
+    }
+
+    // Sampler
+    if (fm["dt-sampler"] !== undefined) {
+      const v = parseInt(String(fm["dt-sampler"]));
+      if (!isNaN(v)) {
+        const sel = this.containerEl.querySelector(".dt-sel") as HTMLSelectElement;
+        if (sel && [...sel.options].some(o => o.value === String(v))) sel.value = String(v);
+      }
+    }
+
+    // Steps (First Slider)
+    if (fm["dt-steps"] !== undefined) {
+      const v = parseInt(String(fm["dt-steps"]));
+      if (!isNaN(v)) {
+        const slider = this.containerEl.querySelector('.dt-slider-wrap input[type="range"]') as HTMLInputElement;
+        const val = slider?.parentElement?.querySelector(".dt-val") as HTMLElement;
+        if (slider && val) { slider.value = String(v); val.textContent = String(v); }
+      }
+    }
+
+    // CFG (Second Slider)
+    if (fm["dt-cfg"] !== undefined) {
+      const v = parseFloat(String(fm["dt-cfg"]));
+      if (!isNaN(v)) {
+        const sliders = this.containerEl.querySelectorAll('.dt-slider-wrap input[type="range"]');
+        if (sliders[1]) {
+          const slider = sliders[1] as HTMLInputElement;
+          const val = slider.parentElement?.querySelector(".dt-val") as HTMLElement;
+          slider.value = String(v); val.textContent = String(v);
+        }
+      }
+    }
+
+    // Size
+    const nums = this.containerEl.querySelectorAll(".dt-num") as NodeListOf<HTMLInputElement>;
+    if (fm["dt-width"] && nums[0]) nums[0].value = String(fm["dt-width"]);
+    if (fm["dt-height"] && nums[1]) nums[1].value = String(fm["dt-height"]);
+  }
+
+  private async renderImageStrip(): Promise<void> {
+    const strip = this.imageStrip;
+    if (!strip) return;
+    strip.empty();
+
+    const file = this.app.workspace.getActiveFile();
+    if (!(file instanceof TFile)) return;
+
+    const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+    const names: string[] = Array.isArray(fm?.["dt-generated-images"]) ? fm["dt-generated-images"] : [];
+    const recent = names.slice(0, this.plugin.settings.recentImagesCount);
+    if (recent.length === 0) return;
+
+    for (const name of recent) {
+      const path = normalizePath(`${this.plugin.settings.out}/${name}`);
+      const url = this.app.vault.adapter.getResourcePath(path);
+      const img = strip.createEl("img", { cls: "dt-thumb" });
+      img.src = url;
+      img.onerror = () => img.remove();
+    }
   }
 }
 
@@ -452,6 +513,8 @@ function injectStyles() {
     .dt-gutter-marker { width: 4px; height: 100%; background: var(--background-modifier-active-hover); opacity: 0.5; border-radius: 2px; }
     .dt-btn:disabled { opacity:.5; cursor:default; }
     .dt-dimmed { opacity: 0.6; pointer-events: none; }
+    .dt-image-strip { display:flex; flex-direction:row; gap:6px; overflow-x:scroll; padding:4px 0; scrollbar-width:thin; min-height: 90px; background: var(--background-secondary); border-radius: 4px; }
+    .dt-thumb { height:80px; width:auto; flex-shrink:0; border-radius:4px; object-fit:cover; }
   `;
   document.head.appendChild(s);
 }
