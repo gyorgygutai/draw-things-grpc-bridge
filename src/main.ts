@@ -1,15 +1,13 @@
-import { Plugin, PluginSettingTab, Setting, ItemView, WorkspaceLeaf, TFile, normalizePath, Notice, AbstractInputSuggest, SearchResult, App } from "obsidian";
+import { Plugin, PluginSettingTab, Setting, ItemView, WorkspaceLeaf, TFile, normalizePath, Notice } from "obsidian";
 import { makeClient, generate } from "./lib";
 import * as grpc from "@grpc/grpc-js";
-import { StateEffect, StateField, RangeSetBuilder } from "@codemirror/state";
-import { Decoration, DecorationSet, EditorView, GutterMarker, gutter } from "@codemirror/view";
 
 const VIEW_TYPE = "draw-things-grpc-bridge";
 
 interface PromptRegion {
   text: string;
-  startLine: number; // 0-based, line after the ## Prompt heading
-  endLine: number;   // 0-based, exclusive (the --- line or EOF)
+  startLine: number;
+  endLine: number;
 }
 
 function parsePrompt(content: string): PromptRegion | null {
@@ -42,58 +40,6 @@ function parsePrompt(content: string): PromptRegion | null {
   return { text, startLine: bodyStart, endLine: bodyEnd };
 }
 
-// --- CM6 decoration extension ---
-
-const setPromptRange = StateEffect.define<{ from: number; to: number } | null>();
-
-const promptRangeField = StateField.define<DecorationSet>({
-  create() { return Decoration.none; },
-  update(deco, tr) {
-    for (const e of tr.effects) {
-      if (e.is(setPromptRange)) {
-        if (!e.value) return Decoration.none;
-        const { from, to } = e.value;
-        const builder = new RangeSetBuilder<Decoration>();
-        const lineDeco = Decoration.line({ attributes: { class: "dt-prompt-line" } });
-        for (let pos = from; pos <= to; ) {
-          const line = tr.state.doc.lineAt(pos);
-          builder.add(line.from, line.from, lineDeco);
-          pos = line.to + 1;
-        }
-        return builder.finish();
-      }
-    }
-    return deco.map(tr.changes);
-  },
-  provide: f => EditorView.decorations.from(f),
-});
-
-class PromptGutterMarker extends GutterMarker {
-  toDOM() {
-    const el = document.createElement("div");
-    el.className = "dt-gutter-marker";
-    return el;
-  }
-}
-const promptGutterMarker = new PromptGutterMarker();
-
-const promptGutterExtension = gutter({
-  class: "dt-prompt-gutter",
-  markers(view) {
-    const deco = view.state.field(promptRangeField, false);
-    if (!deco) return Decoration.none as any;
-    const builder = new RangeSetBuilder<GutterMarker>();
-    deco.between(0, view.state.doc.length, (from) => {
-      const line = view.state.doc.lineAt(from);
-      builder.add(line.from, line.from, promptGutterMarker);
-    });
-    return builder.finish();
-  },
-  initialSpacer: () => promptGutterMarker,
-});
-
-const dtEditorExtension = [promptRangeField, promptGutterExtension];
-
 const SAMPLERS: [string, number][] = [
   ["DPM++ 2M Karras", 0], ["Euler A", 1], ["DDIM", 2], ["PLMS", 3],
   ["DPM++ SDE Karras", 4], ["UniPC", 5], ["LCM", 6], ["Euler A Substep", 7],
@@ -114,32 +60,10 @@ const DEFAULT_FORM_VALUES = {
 interface DTSettings { host: string; out: string; recentImagesCount: number; }
 const DEFAULTS: DTSettings = { host: "127.0.0.1:7888", out: ".dt-output", recentImagesCount: 15 };
 
-class FileSuggest extends AbstractInputSuggest<SearchResult> {
-  private cb: (file: TFile) => void;
-  constructor(app: App, inputEl: HTMLInputElement, cb: (file: TFile) => void) {
-    super(app, inputEl);
-    this.cb = cb;
-  }
-  getSuggestions(query: string): SearchResult[] {
-    return this.app.vault
-      .getFiles()
-      .filter(f => f.name.toLowerCase().includes(query.toLowerCase()))
-      .map(f => ({ file: f, score: 0 }));
-  }
-  renderSuggestion(value: SearchResult, el: HTMLElement): void {
-    el.createDiv({ text: value.file.name });
-  }
-  selectSuggestion(value: SearchResult, evt: MouseEvent | KeyboardEvent): void {
-    this.inputEl.value = value.file.name;
-    this.cb(value.file);
-    this.close();
-  }
-}
-
 class DTView extends ItemView {
   plugin: DTPlugin;
   private intersectionObserver: IntersectionObserver | null = null;
-  private sidebarVisible = false;
+  private generating = false;
 
   constructor(leaf: WorkspaceLeaf, plugin: DTPlugin) {
     super(leaf);
@@ -150,108 +74,48 @@ class DTView extends ItemView {
   getDisplayText() { return "Draw Things"; }
   getIcon() { return "image"; }
 
-  private imageStrip: HTMLElement | null = null;
-
   async onOpen() {
-    this.render();
-    const active = this.app.workspace.getActiveFile();
-    if (active instanceof TFile) this.syncFormFromFrontmatter(active);
-    this.updateControlsState();
-    this.registerEvent(
-      this.app.workspace.on('active-leaf-change', async () => {
-        this.updateControlsState();
-        const active = this.app.workspace.getActiveFile();
-        if (active instanceof TFile) this.syncFormFromFrontmatter(active);
-      })
-    );
-    this.registerEvent(
-      this.app.metadataCache.on('changed', (file) => {
-        if (file === this.app.workspace.getActiveFile()) {
-          this.renderImageStrip();
-        }
-      })
-    );
+    this.registerEvent(this.app.workspace.on('active-leaf-change', () => this.render()));
+    this.registerEvent(this.app.workspace.on('file-open', () => this.render()));
+    this.registerEvent(this.app.vault.on('delete', (file) => {
+      if (file === this.app.workspace.getActiveFile()) this.render();
+    }));
+    this.registerEvent(this.app.vault.on('rename', (file) => {
+      if (file === this.app.workspace.getActiveFile()) this.render();
+    }));
+    this.registerEvent(this.app.metadataCache.on('changed', (file) => {
+      if (file === this.app.workspace.getActiveFile()) this.render();
+    }));
+
     this.intersectionObserver = new IntersectionObserver(
-      ([entry]) => {
-        this.sidebarVisible = entry.isIntersecting;
-        if (entry.isIntersecting) {
-          this.updateControlsState();
-        } else {
-          this.clearDecoration();
-        }
-      },
+      ([entry]) => { if (entry.isIntersecting) this.render(); },
       { threshold: 0 }
     );
     this.intersectionObserver.observe(this.containerEl);
+
+    this.render();
   }
 
   async onClose() {
     this.intersectionObserver?.disconnect();
     this.intersectionObserver = null;
-    this.clearDecoration();
   }
 
-  private clearDecoration() {
-    this.app.workspace.iterateAllLeaves(leaf => {
-      const cm: EditorView | undefined = (leaf.view as any)?.editor?.cm;
-      if (cm) cm.dispatch({ effects: setPromptRange.of(null) });
-    });
-  }
-
-  private async updateControlsState(): Promise<void> {
-    if (!this.sidebarVisible) {
-      this.clearDecoration();
-      return;
-    }
+  async render() {
     const file = this.app.workspace.getActiveFile();
-    let region: PromptRegion | null = null;
+    if (file instanceof TFile) await this.app.vault.cachedRead(file);
+    const fm = (file instanceof TFile) ? (this.app.metadataCache.getFileCache(file)?.frontmatter ?? {}) : {};
 
-    if (file instanceof TFile) {
-      const content = await this.app.vault.cachedRead(file);
-      region = parsePrompt(content);
-    }
+    const values = {
+      model:   typeof fm["dt-model"]   === "string" ? fm["dt-model"]             : DEFAULT_FORM_VALUES.model,
+      sampler: fm["dt-sampler"]        !== undefined ? parseInt(fm["dt-sampler"]) : DEFAULT_FORM_VALUES.sampler,
+      steps:   fm["dt-steps"]          !== undefined ? parseInt(fm["dt-steps"])   : DEFAULT_FORM_VALUES.steps,
+      cfg:     fm["dt-cfg"]            !== undefined ? parseFloat(fm["dt-cfg"])   : DEFAULT_FORM_VALUES.cfg,
+      width:   fm["dt-width"]          !== undefined ? parseInt(fm["dt-width"])   : DEFAULT_FORM_VALUES.width,
+      height:  fm["dt-height"]         !== undefined ? parseInt(fm["dt-height"])  : DEFAULT_FORM_VALUES.height,
+      images:  Array.isArray(fm["dt-generated-images"]) ? fm["dt-generated-images"] as string[] : [],
+    };
 
-    const enabled = region !== null;
-    const controls = this.containerEl.querySelectorAll('input, select, button');
-    controls.forEach(el => { (el as HTMLInputElement).disabled = !enabled; });
-
-    const root = this.containerEl.children[1] as HTMLElement;
-    if (root) root.classList.toggle('dt-dimmed', !enabled);
-
-    this.applyDecoration(region);
-  }
-
-  private applyDecoration(region: PromptRegion | null): void {
-    const activeFile = this.app.workspace.getActiveFile();
-    let cm: EditorView | undefined;
-    this.app.workspace.iterateAllLeaves(leaf => {
-      if (cm) return;
-      const v = leaf.view as any;
-      if (v?.getViewType?.() === 'markdown' && v?.file === activeFile) {
-        const candidate: EditorView | undefined = v?.editor?.cm;
-        if (candidate) cm = candidate;
-      }
-    });
-    if (!cm) return;
-
-    if (!region) {
-      cm.dispatch({ effects: setPromptRange.of(null) });
-      return;
-    }
-
-    const doc = cm.state.doc;
-    const startCM = region.startLine + 1;
-    const endCM = region.endLine;
-    if (startCM > doc.lines || endCM < startCM) {
-      cm.dispatch({ effects: setPromptRange.of(null) });
-      return;
-    }
-    const from = doc.line(Math.min(startCM, doc.lines)).from;
-    const to = doc.line(Math.min(Math.max(endCM, startCM), doc.lines)).from;
-    cm.dispatch({ effects: setPromptRange.of({ from, to }) });
-  }
-
-  render() {
     const root = this.containerEl.children[1] as HTMLElement;
     root.empty();
     root.style.cssText = "padding:12px;display:flex;flex-direction:column;gap:8px;";
@@ -262,70 +126,64 @@ class DTView extends ItemView {
       return r;
     };
 
-    const separatedRow = (label: string, parent = root) => {
-      const r = parent.createDiv({ cls: "dt-separated-row" });
-
-      r.createEl("hr", { text: label, cls: "dt-hr" });
-
-      return row(label, parent);
-    };
-
+    // --- Model ---
     const modelRow = row("Model");
-    modelRow.createEl("span", { text: DEFAULT_FORM_VALUES.model, cls: "dt-model" });
+    modelRow.createEl("span", { text: values.model, cls: "dt-model" });
+    root.createEl("hr", { cls: "dt-hr" });
 
+    // --- Sampler ---
     const sampRow = row("Sampler");
     const sampSel = sampRow.createEl("select", { cls: "dt-sel" });
     SAMPLERS.forEach(([n, v]) => {
       const opt = sampSel.createEl("option", { value: String(v), text: n });
-      if (v === DEFAULT_FORM_VALUES.sampler) opt.selected = true;
+      if (v === values.sampler) opt.selected = true;
     });
 
+    // --- Steps ---
     const stepsRow = row("Steps");
     const stepsWrap = stepsRow.createDiv({ cls: "dt-slider-wrap" });
     const stepsSlider = stepsWrap.createEl("input", {
-      type: "range",
-      attr: { min: "1", max: "100", value: String(DEFAULT_FORM_VALUES.steps) }
+      type: "range", attr: { min: "1", max: "100", value: String(values.steps) }
     });
-    const stepsVal = stepsWrap.createEl("span", { text: String(DEFAULT_FORM_VALUES.steps), cls: "dt-val" });
+    const stepsVal = stepsWrap.createEl("span", { text: String(values.steps), cls: "dt-val" });
     stepsSlider.oninput = () => stepsVal.textContent = stepsSlider.value;
 
+    // --- CFG ---
     const cfgRow = row("CFG");
     const cfgWrap = cfgRow.createDiv({ cls: "dt-slider-wrap" });
     const cfgSlider = cfgWrap.createEl("input", {
-      type: "range",
-      attr: { min: "1", max: "20", step: "0.5", value: String(DEFAULT_FORM_VALUES.cfg) }
+      type: "range", attr: { min: "1", max: "20", step: "0.5", value: String(values.cfg) }
     });
-    const cfgVal = cfgWrap.createEl("span", { text: String(DEFAULT_FORM_VALUES.cfg), cls: "dt-val" });
+    const cfgVal = cfgWrap.createEl("span", { text: String(values.cfg), cls: "dt-val" });
     cfgSlider.oninput = () => cfgVal.textContent = cfgSlider.value;
+    root.createEl("hr", { cls: "dt-hr" });
 
+    // --- Size ---
     const sizeRow = row("Size");
     const sizeWrap = sizeRow.createDiv({ cls: "dt-size-wrap" });
-    const wIn = sizeWrap.createEl("input", { cls: "dt-num", type: "number", value: String(DEFAULT_FORM_VALUES.width) });
+    const wIn = sizeWrap.createEl("input", { cls: "dt-num", type: "number", value: String(values.width) });
     sizeWrap.createEl("span", { text: "×", cls: "dt-x" });
-    const hIn = sizeWrap.createEl("input", { cls: "dt-num", type: "number", value: String(DEFAULT_FORM_VALUES.height) });
+    const hIn = sizeWrap.createEl("input", { cls: "dt-num", type: "number", value: String(values.height) });
+    root.createEl("hr", { cls: "dt-hr" });
 
+    // --- Input Image ---
     const inputImgRow = row("Input Image");
-    const inputImgInput = inputImgRow.createEl("input", {
-      type: "text",
-      placeholder: "Select an image...",
-      cls: "dt-image-input",
-    });
-    let inputImageFile: TFile | null = null;
-    new FileSuggest(this.app, inputImgInput, (f) => { inputImageFile = f; });
+    const inputImgInput = inputImgRow.createEl("input", { type: "file", attr: { accept: "image/*" }, cls: "dt-file-input" });
+    let inputImageFile: File | null = null;
+    inputImgInput.onchange = () => { inputImageFile = inputImgInput.files?.[0] ?? null; };
 
-    const refImageFiles: (TFile | null)[] = [null, null, null];
+    // --- Reference Images ---
+    const refImageFiles: (File | null)[] = [null, null, null];
     for (let i = 1; i <= 3; i++) {
       const refRow = row(`Reference ${i}`);
-      const refIn = refRow.createEl("input", {
-        type: "text",
-        placeholder: "Select an image...",
-        cls: "dt-image-input",
-      });
-      new FileSuggest(this.app, refIn, (f) => { refImageFiles[i - 1] = f; });
+      const refIn = refRow.createEl("input", { type: "file", attr: { accept: "image/*" }, cls: "dt-file-input" });
+      refIn.onchange = ((idx) => () => { refImageFiles[idx] = refIn.files?.[0] ?? null; })(i - 1);
     }
+    root.createEl("hr", { cls: "dt-hr" });
 
-    const btn = root.createEl("button", { text: "Generate", cls: "dt-btn" });
-
+    // --- Generate Button ---
+    const btn = root.createEl("button", { text: this.generating ? "Generating..." : "Generate", cls: "dt-btn" });
+    if (this.generating) btn.disabled = true;
     btn.onclick = async () => {
       const file = this.app.workspace.getActiveFile();
       if (!(file instanceof TFile)) { new Notice("No active note"); return; }
@@ -336,34 +194,29 @@ class DTView extends ItemView {
       const prompt = region.text;
 
       let inputImageBytes: Uint8Array | undefined;
-      if (inputImageFile) inputImageBytes = new Uint8Array(await this.app.vault.readBinary(inputImageFile));
+      if (inputImageFile) inputImageBytes = new Uint8Array(await inputImageFile.arrayBuffer());
 
       const refImageBytes: Uint8Array[] = [];
       for (const f of refImageFiles) {
-        if (f) refImageBytes.push(new Uint8Array(await this.app.vault.readBinary(f)));
+        if (f) refImageBytes.push(new Uint8Array(await f.arrayBuffer()));
       }
 
       const w = parseInt(wIn.value);
       const h = parseInt(hIn.value);
       if (isNaN(w) || w < 64 || isNaN(h) || h < 64) { new Notice("Width and height must be at least 64"); return; }
 
-      btn.disabled = true;
-      btn.textContent = "Generating...";
+      const currentModel = (modelRow.querySelector(".dt-model") as HTMLElement)?.textContent || values.model;
+
+      this.generating = true;
+      this.render();
 
       try {
         const name = await generate(
-          this.plugin.getClient(),
-          prompt,
-          parseInt(stepsSlider.value),
-          parseFloat(cfgSlider.value),
-          parseInt(sampSel.value),
-          w, h,
-          Math.floor(Math.random() * 0xffffffff),
-          (this.containerEl.querySelector(".dt-model") as HTMLElement)?.textContent || DEFAULT_FORM_VALUES.model,
-          this.app.vault,
-          normalizePath(this.plugin.settings.out),
-          inputImageBytes,
-          refImageBytes
+          this.plugin.getClient(), prompt,
+          parseInt(stepsSlider.value), parseFloat(cfgSlider.value), parseInt(sampSel.value),
+          w, h, Math.floor(Math.random() * 0xffffffff), currentModel,
+          this.app.vault, normalizePath(this.plugin.settings.out),
+          inputImageBytes, refImageBytes
         );
 
         await this.app.fileManager.processFrontMatter(file, (fm) => {
@@ -372,88 +225,34 @@ class DTView extends ItemView {
         });
 
         new Notice(`Image generated: ${name}`);
-        console.log("[DT] Image saved as:", name);
       } catch (e: any) {
         new Notice(`Error: ${e.message ?? String(e)}`);
       } finally {
-        btn.disabled = false;
-        btn.textContent = "Generate";
+        this.generating = false;
+        this.render();
       }
     };
 
     injectStyles();
 
-    this.imageStrip = root.createDiv({ cls: "dt-image-strip" });
-    this.renderImageStrip();
-  }
-
-  private syncFormFromFrontmatter(file: TFile) {
-    const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
-    if (!fm) return;
-
-    // Model
-    if (typeof fm["dt-model"] === "string") {
-      const span = this.containerEl.querySelector(".dt-model") as HTMLElement;
-      if (span) span.textContent = fm["dt-model"];
-    }
-
-    // Sampler
-    if (fm["dt-sampler"] !== undefined) {
-      const v = parseInt(String(fm["dt-sampler"]));
-      if (!isNaN(v)) {
-        const sel = this.containerEl.querySelector(".dt-sel") as HTMLSelectElement;
-        if (sel && [...sel.options].some(o => o.value === String(v))) sel.value = String(v);
-      }
-    }
-
-    // Steps (First Slider)
-    if (fm["dt-steps"] !== undefined) {
-      const v = parseInt(String(fm["dt-steps"]));
-      if (!isNaN(v)) {
-        const slider = this.containerEl.querySelector('.dt-slider-wrap input[type="range"]') as HTMLInputElement;
-        const val = slider?.parentElement?.querySelector(".dt-val") as HTMLElement;
-        if (slider && val) { slider.value = String(v); val.textContent = String(v); }
-      }
-    }
-
-    // CFG (Second Slider)
-    if (fm["dt-cfg"] !== undefined) {
-      const v = parseFloat(String(fm["dt-cfg"]));
-      if (!isNaN(v)) {
-        const sliders = this.containerEl.querySelectorAll('.dt-slider-wrap input[type="range"]');
-        if (sliders[1]) {
-          const slider = sliders[1] as HTMLInputElement;
-          const val = slider.parentElement?.querySelector(".dt-val") as HTMLElement;
-          slider.value = String(v); val.textContent = String(v);
-        }
-      }
-    }
-
-    // Size
-    const nums = this.containerEl.querySelectorAll(".dt-num") as NodeListOf<HTMLInputElement>;
-    if (fm["dt-width"] && nums[0]) nums[0].value = String(fm["dt-width"]);
-    if (fm["dt-height"] && nums[1]) nums[1].value = String(fm["dt-height"]);
-  }
-
-  private async renderImageStrip(): Promise<void> {
-    const strip = this.imageStrip;
-    if (!strip) return;
-    strip.empty();
-
-    const file = this.app.workspace.getActiveFile();
-    if (!(file instanceof TFile)) return;
-
-    const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
-    const names: string[] = Array.isArray(fm?.["dt-generated-images"]) ? fm["dt-generated-images"] : [];
-    const recent = names.slice(0, this.plugin.settings.recentImagesCount);
-    if (recent.length === 0) return;
-
-    for (const name of recent) {
+    // --- Image Strip ---
+    const strip = root.createDiv({ cls: "dt-image-strip" });
+    for (const name of values.images.slice(0, this.plugin.settings.recentImagesCount)) {
       const path = normalizePath(`${this.plugin.settings.out}/${name}`);
       const url = this.app.vault.adapter.getResourcePath(path);
       const img = strip.createEl("img", { cls: "dt-thumb" });
       img.src = url;
       img.onerror = () => img.remove();
+    }
+
+    // --- Dimming ---
+    if (!(file instanceof TFile)) {
+      root.classList.add('dt-dimmed');
+    } else {
+      this.app.vault.cachedRead(file).then(content => {
+        if (!parsePrompt(content)) root.classList.add('dt-dimmed');
+        else root.classList.remove('dt-dimmed');
+      });
     }
   }
 }
@@ -466,7 +265,6 @@ export default class DTPlugin extends Plugin {
     await this.loadSettings();
     this.addSettingTab(new DTSettingsTab(this.app, this));
     this.registerView(VIEW_TYPE, (leaf) => new DTView(leaf, this));
-    this.registerEditorExtension(dtEditorExtension);
     this.activateView();
   }
 
@@ -506,15 +304,13 @@ function injectStyles() {
     .dt-size-wrap { flex:1; display:flex; align-items:center; gap:6px; }
     .dt-num { flex:1; background:var(--background-secondary); border:1px solid var(--background-modifier-border); border-radius:4px; color:var(--text-normal); padding:3px 6px; font-size:12px; width:0; }
     .dt-x { color:var(--text-muted); font-size:12px; }
-    .dt-image-input { flex:1; background:var(--background-secondary); border:1px solid var(--background-modifier-border); border-radius:4px; color:var(--text-normal); padding:3px 6px; font-size:12px; }
+    .dt-file-input { flex:1; font-size:12px; color:var(--text-normal); min-width:0; }
     .dt-btn { width:100%; padding:6px; background:var(--interactive-accent); color:var(--text-on-accent); border:none; border-radius:4px; cursor:pointer; font-size:13px; }
-    .dt-prompt-line { background: color-mix(in srgb, var(--background-modifier-active-hover) 25%, transparent); }
-    .dt-prompt-gutter { width: 4px !important; }
-    .dt-gutter-marker { width: 4px; height: 100%; background: var(--background-modifier-active-hover); opacity: 0.5; border-radius: 2px; }
     .dt-btn:disabled { opacity:.5; cursor:default; }
     .dt-dimmed { opacity: 0.6; pointer-events: none; }
     .dt-image-strip { display:flex; flex-direction:row; gap:6px; overflow-x:scroll; padding:4px 0; scrollbar-width:thin; min-height: 90px; background: var(--background-secondary); border-radius: 4px; }
-    .dt-thumb { height:80px; width:auto; flex-shrink:0; border-radius:4px; object-fit:cover; }
+    .dt-thumb { height:160px; width:auto; flex-shrink:0; border-radius:4px; object-fit:cover; }
+    .dt-hr { border: 0; border-top: 1px solid var(--background-modifier-border); margin: 8px 0; width: 100%; }
   `;
   document.head.appendChild(s);
 }
