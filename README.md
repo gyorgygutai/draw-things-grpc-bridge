@@ -2,6 +2,8 @@
 
 Generate images directly in Obsidian using the **Draw Things** macOS/iOS app via gRPC.
 
+> Warning: this plugin is currently nowhere near production ready. It exists as a proof of concept to solve my own problem.
+
 ## Features
 
 ✅ Write prompts in `` code blocks  
